@@ -1,15 +1,15 @@
-#ifndef GGUF_H
-#define GGUF_H
+#ifndef MODEL_H
+#define MODEL_H
 
 #include <stdint.h>
+#include <windows.h>
 
-typedef struct{
-    char magic[5];
-    uint32_t version;
-    uint64_t tensor_count;
-    uint64_t metadata_count;
-} GGUFHeader;
-
-int gguf_read_header(const char *path, GGUFHeader *header);
+typedef struct {
+    uint8_t *data;
+    uint64_t file_size;
+    uint64_t data_start;
+    HANDLE file;
+    HANDLE mapping;
+} Model;
 
 #endif

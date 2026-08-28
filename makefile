@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-O3 -std=c99 -Wall -Wextra -mavx2 -mfma
+CFLAGS=-O3 -std=c99 -Wall -Wextra -mavx2 -mfma -Iinclude
 
 SRC=$(wildcard src/*.c)
 OBJ=$(SRC:.c=.o)
