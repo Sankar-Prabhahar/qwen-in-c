@@ -5,10 +5,14 @@
 #include "mmap.h"
 #include "rmsnorm.h"
 #include "tensor_data.h"
+#include "attention.h"
+#include "rope.h"
 #include "quant.h"
 #include "gemv.h"
+#include "kv_cache.h"
 #include "tensor_index.h"
 #include <windows.h>
+#include "softmax.h"
 #include "simd.h"
 #include "q6k.h"
 void test_avx2();
@@ -30,6 +34,14 @@ int main(int argc, char **argv)
     printf("=== Qwen30B-in-C ===\n");
 
     test_avx2();
+    float rope_vec[8] = {1,2,3,4,5,6,7,8};
+
+rope_apply(rope_vec, 8, 1, 10000.0f);
+
+printf("RoPE: ");
+for(int i = 0; i < 8; i++)
+    printf("%.4f ", rope_vec[i]);
+printf("\n");
 
 block_q6_K test_block = {0};
 test_block.d = 0x3C00;
@@ -254,11 +266,58 @@ float w[4] = {1,1,1,1};
 float y[4];
 
 rmsnorm(y, x, w, 4, 1e-5f);
+float sm[3] = {1,2,3};
 
+softmax(sm, 3);
+
+printf("Softmax: ");
+for(int i=0;i<3;i++)
+    printf("%.4f ", sm[i]);
+printf("\n");
+float Q[4] = {1,0,0,0};
+
+float K[8] = {
+    1,0,0,0,
+    0,1,0,0
+};
+
+float V[8] = {
+    10,20,30,40,
+    50,60,70,80
+};
+
+float A[4];
+
+KVCache cache;
+
+kv_init(&cache, 8, 4);
+
+float q[4] = {1,0,0,0};
+
+float k1[4]={1,0,0,0};
+float v1[4]={10,20,30,40};
+
+float k2[4]={0,1,0,0};
+float v2[4]={50,60,70,80};
+
+kv_push(&cache,k1,v1);
+kv_push(&cache,k2,v2);
+
+float out[4];
+
+attention_cached(q,&cache,out);
+
+printf("Cached Attention: ");
+for(int i=0;i<4;i++)
+    printf("%.3f ", out[i]);
+printf("\n");
+
+kv_free(&cache);
 printf("RMSNorm: ");
 for(int i=0;i<4;i++)
     printf("%.4f ", y[i]);
 printf("\n");
+
 if(found){
 
     printf("\nTensor Lookup Success\n");

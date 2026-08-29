@@ -24,4 +24,5 @@ void q6k_dump_block(const block_q6_K *block);
 void q6k_extract_low4(const block_q6_K *block, uint8_t out[256]);
 void q6k_extract_high2(const block_q6_K *block, uint8_t out[256]);
 void q6k_decode_block_exact(const block_q6_K *block, float out[QK_K]);
+
 #endif
