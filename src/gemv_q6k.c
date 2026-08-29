@@ -2,15 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <omp.h>
 
 #include "gemv_q6k.h"
 
 /*
- * Decode one Q6_K block (256 floats) directly into a temporary buffer,
- * then compute the dot product with x[256] using AVX2 FMA.
- *
- * The inner decode+dot is fused to avoid allocating a full 256-float buffer
- * for every block — we accumulate 8 floats at a time via AVX2.
+ * Decode one Q6_K block (256 floats) directly and dot with x[256] using AVX2.
  */
 static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
 {
@@ -20,13 +17,6 @@ static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
     const int8_t  *sc   = blk->scales;
 
     __m256 acc = _mm256_setzero_ps();
-
-    /*
-     * Two halves of 128 weights each.
-     * Inner loop processes 8 weights at a time using scalar decode + AVX2 dot.
-     * (Full vectorised decode of 6-bit integers is complex; scalar decode +
-     *  AVX2 accumulation is clean and still much faster than naive float GEMV.)
-     */
     float tmp[8];
 
     for (int half = 0; half < 2; half++) {
@@ -36,13 +26,6 @@ static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
         const float   *x_h  = x  + half * 128;
 
         for (int l = 0; l < 32; l += 8) {
-            /* Decode 8 groups of 4 values each (q1, q2, q3, q4 per l) */
-            /* q1 = ql[l+ 0] lo4 | qh[l] bits[1:0] << 4   → output[l+ 0] */
-            /* q2 = ql[l+32] lo4 | qh[l] bits[3:2] << 4   → output[l+32] */
-            /* q3 = ql[l+ 0] hi4 | qh[l] bits[5:4] << 4   → output[l+64] */
-            /* q4 = ql[l+32] hi4 | qh[l] bits[7:6] << 4   → output[l+96] */
-
-            /* Unroll 8 l values */
             for (int i = 0; i < 8; i++) {
                 int li = l + i;
                 int cur_is = li / 16;
@@ -56,7 +39,6 @@ static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
                 float w3 = s3 * (float)(int)(((ql_h[li]       >>  4)  | (((qh_h[li] >> 4) & 3) << 4)) - 32);
                 float w4 = s4 * (float)(int)(((ql_h[li + 32]  >>  4)  | (((qh_h[li] >> 6) & 3) << 4)) - 32);
 
-                /* Multiply each decoded weight by its corresponding x element */
                 tmp[i] = w1 * x_h[li] + w2 * x_h[li + 32] + w3 * x_h[li + 64] + w4 * x_h[li + 96];
             }
 
@@ -65,7 +47,6 @@ static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
         }
     }
 
-    /* Horizontal sum */
     float buf[8];
     _mm256_storeu_ps(buf, acc);
     float sum = 0.0f;
@@ -92,9 +73,9 @@ int gemv_q6k(const Model *model,
 
     int blocks_per_row = cols / QK_K;
     size_t row_bytes   = (size_t)blocks_per_row * sizeof(block_q6_K);
-
     const uint8_t *base = model->data + model->data_start + weight->offset;
 
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
         const block_q6_K *row = (const block_q6_K *)(base + (size_t)r * row_bytes);
         float sum = 0.0f;
