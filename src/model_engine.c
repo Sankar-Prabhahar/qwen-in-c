@@ -44,16 +44,6 @@ int engine_init(Engine *engine, const char *model_path)
     if (!engine || !model_path) return 0;
     memset(engine, 0, sizeof(Engine));
 
-    /* Default hyperparameters for TinyLlama */
-    engine->hidden_dim = 2048;
-    engine->n_layers = 22;
-    engine->n_heads = 32;
-    engine->n_kv_heads = 4;
-    engine->head_dim = 64;
-    engine->intermediate_dim = 5632;
-    engine->eps = 1e-5f;
-    engine->theta = 10000.0f;
-
     if (!model_map(model_path, &engine->model)) {
         printf("engine_init: failed to mmap %s\n", model_path);
         return 0;
@@ -62,6 +52,62 @@ int engine_init(Engine *engine, const char *model_path)
     gguf_read_header(&engine->model, &engine->header);
     build_tensor_index(&engine->model, &engine->header, &engine->index);
     tokenizer_init(&engine->model, &engine->header, &engine->tokenizer);
+
+    /* 1. Architecture Detection (qwen2, qwen3, qwen2moe, llama, etc.) */
+    char arch[64] = "llama";
+    if (gguf_get_meta_str(&engine->model, &engine->header, "general.architecture", arch, sizeof(arch))) {
+        snprintf(engine->arch, sizeof(engine->arch), "%s", arch);
+    } else {
+        snprintf(engine->arch, sizeof(engine->arch), "llama");
+    }
+
+    /* 2. Hyperparameter Extraction */
+    char key[128];
+    uint32_t val_u32 = 0;
+    float val_f32 = 0.0f;
+
+    snprintf(key, sizeof(key), "%s.block_count", engine->arch);
+    engine->n_layers = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 22;
+
+    snprintf(key, sizeof(key), "%s.embedding_length", engine->arch);
+    engine->hidden_dim = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 2048;
+
+    snprintf(key, sizeof(key), "%s.attention.head_count", engine->arch);
+    engine->n_heads = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 32;
+
+    snprintf(key, sizeof(key), "%s.attention.head_count_kv", engine->arch);
+    engine->n_kv_heads = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 4;
+
+    snprintf(key, sizeof(key), "%s.feed_forward_length", engine->arch);
+    engine->intermediate_dim = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 5632;
+
+    snprintf(key, sizeof(key), "%s.attention.layer_norm_rms_epsilon", engine->arch);
+    engine->eps = gguf_get_meta_f32(&engine->model, &engine->header, key, &val_f32) ? val_f32 : 1e-5f;
+
+    snprintf(key, sizeof(key), "%s.rope.freq_base", engine->arch);
+    engine->theta = gguf_get_meta_f32(&engine->model, &engine->header, key, &val_f32) ? val_f32 : 10000.0f;
+
+    /* 3. Mixture-of-Experts Parameters (Qwen3-30B-A3B / Qwen-MoE) */
+    snprintf(key, sizeof(key), "%s.expert_count", engine->arch);
+    if (gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) && val_u32 > 0) {
+        engine->is_moe = 1;
+        engine->num_experts = (int)val_u32;
+
+        snprintf(key, sizeof(key), "%s.expert_used_count", engine->arch);
+        engine->num_active_experts = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 4;
+
+        snprintf(key, sizeof(key), "%s.expert_feed_forward_length", engine->arch);
+        engine->expert_intermediate_dim = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : engine->intermediate_dim;
+
+        snprintf(key, sizeof(key), "%s.expert_shared_feed_forward_length", engine->arch);
+        engine->shared_intermediate_dim = gguf_get_meta_u32(&engine->model, &engine->header, key, &val_u32) ? (int)val_u32 : 0;
+    } else {
+        engine->is_moe = 0;
+        engine->num_experts = 0;
+        engine->num_active_experts = 0;
+        engine->expert_intermediate_dim = 0;
+        engine->shared_intermediate_dim = 0;
+    }
 
     engine->token_embd  = find_tensor(&engine->index, "token_embd.weight");
     engine->output_norm = find_tensor(&engine->index, "output_norm.weight");
@@ -76,7 +122,6 @@ int engine_init(Engine *engine, const char *model_path)
         return 0;
     }
 
-    /* Assign real dimensions from tensor metadata */
     engine->hidden_dim  = (int)engine->token_embd->dims[0];
     engine->vocab_size  = (int)engine->token_embd->dims[1];
     engine->head_dim    = engine->hidden_dim / engine->n_heads;
@@ -113,8 +158,9 @@ int engine_init(Engine *engine, const char *model_path)
         }
     }
 
-    printf("engine_init: loaded %d layers | hidden=%d | vocab=%d\n",
-           engine->n_layers, engine->hidden_dim, engine->vocab_size);
+    printf("engine_init: loaded architecture '%s' | %d layers | hidden=%d | vocab=%d%s\n",
+           engine->arch, engine->n_layers, engine->hidden_dim, engine->vocab_size,
+           engine->is_moe ? " [MoE Enabled]" : "");
     fflush(stdout);
     return 1;
 }
@@ -143,8 +189,9 @@ int engine_forward(Engine *engine,
         return 0;
     }
 
-    /* 2. Loop through all 22 Transformer Layers */
+    /* 2. Loop through all Transformer Layers (Dense or MoE) */
     for (int l = 0; l < engine->n_layers; l++) {
+        int intermediate = engine->layers[l].is_moe ? engine->expert_intermediate_dim : engine->intermediate_dim;
         transformer_block_forward(&engine->model,
                                   &engine->layers[l],
                                   cache,
@@ -155,7 +202,10 @@ int engine_forward(Engine *engine,
                                   engine->n_heads,
                                   engine->n_kv_heads,
                                   engine->head_dim,
-                                  engine->intermediate_dim,
+                                  intermediate,
+                                  engine->num_experts,
+                                  engine->num_active_experts,
+                                  engine->shared_intermediate_dim,
                                   engine->eps,
                                   engine->theta);
     }

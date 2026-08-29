@@ -54,12 +54,13 @@ static float dot_q6k_block_avx2(const block_q6_K *blk, const float *x)
     return sum;
 }
 
-int gemv_q6k(const Model *model,
-             const Tensor *weight,
-             const float *x,
-             float *output,
-             int rows,
-             int cols)
+int gemv_q6k_offset(const Model *model,
+                    const Tensor *weight,
+                    uint64_t extra_byte_offset,
+                    const float *x,
+                    float *output,
+                    int rows,
+                    int cols)
 {
     if (!model || !weight || !x || !output) return 0;
     if (weight->type != 14) {
@@ -73,7 +74,7 @@ int gemv_q6k(const Model *model,
 
     int blocks_per_row = cols / QK_K;
     size_t row_bytes   = (size_t)blocks_per_row * sizeof(block_q6_K);
-    const uint8_t *base = model->data + model->data_start + weight->offset;
+    const uint8_t *base = model->data + model->data_start + weight->offset + extra_byte_offset;
 
     #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; r++) {
@@ -86,4 +87,14 @@ int gemv_q6k(const Model *model,
     }
 
     return 1;
+}
+
+int gemv_q6k(const Model *model,
+             const Tensor *weight,
+             const float *x,
+             float *output,
+             int rows,
+             int cols)
+{
+    return gemv_q6k_offset(model, weight, 0, x, output, rows, cols);
 }

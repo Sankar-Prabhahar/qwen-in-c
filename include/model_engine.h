@@ -8,6 +8,7 @@
 #include "tokenizer.h"
 #include "kv_cache.h"
 #include "sampler.h"
+#include "moe.h"
 
 #define MAX_LAYERS 64
 
@@ -24,6 +25,7 @@ typedef struct {
 
     TransformerBlockWeights layers[MAX_LAYERS];
 
+    char arch[64];
     int hidden_dim;
     int n_layers;
     int n_heads;
@@ -31,6 +33,14 @@ typedef struct {
     int head_dim;
     int intermediate_dim;
     int vocab_size;
+
+    /* Mixture-of-Experts metadata (Qwen3-30B-A3B / Qwen-MoE) */
+    int is_moe;
+    int num_experts;
+    int num_active_experts;
+    int expert_intermediate_dim;
+    int shared_intermediate_dim;
+
     float eps;
     float theta;
 } Engine;

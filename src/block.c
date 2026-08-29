@@ -8,6 +8,7 @@
 #include "rope.h"
 #include "attention.h"
 #include "ffn.h"
+#include "moe.h"
 #include "q6k.h"
 
 static void read_float_tensor(const Model *model, const Tensor *t, float *dest, int n)
@@ -28,7 +29,9 @@ static void read_float_tensor(const Model *model, const Tensor *t, float *dest, 
 int load_block_weights(TensorIndex *index, int layer, TransformerBlockWeights *w)
 {
     char name[128];
+    memset(w, 0, sizeof(TransformerBlockWeights));
 
+    /* 1. Attention Base Tensors */
     snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", layer);
     w->attn_norm = find_tensor(index, name);
 
@@ -47,6 +50,43 @@ int load_block_weights(TensorIndex *index, int layer, TransformerBlockWeights *w
     snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", layer);
     w->ffn_norm = find_tensor(index, name);
 
+    if (!w->attn_norm || !w->attn_q || !w->attn_k || !w->attn_v || !w->attn_output || !w->ffn_norm) {
+        return 0;
+    }
+
+    /* 2. Check for Mixture-of-Experts Tensors (Qwen-MoE / Mixtral) */
+    snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", layer);
+    Tensor *router = find_tensor(index, name);
+
+    snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", layer);
+    Tensor *gate_exps = find_tensor(index, name);
+
+    if (router && gate_exps) {
+        w->is_moe = 1;
+        w->moe.router_weight = router;
+        w->moe.gate_exps     = gate_exps;
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", layer);
+        w->moe.up_exps = find_tensor(index, name);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", layer);
+        w->moe.down_exps = find_tensor(index, name);
+
+        /* Optional shared expert */
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", layer);
+        w->moe.gate_shexp = find_tensor(index, name);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", layer);
+        w->moe.up_shexp = find_tensor(index, name);
+
+        snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", layer);
+        w->moe.down_shexp = find_tensor(index, name);
+
+        return (w->moe.router_weight && w->moe.gate_exps && w->moe.up_exps && w->moe.down_exps);
+    }
+
+    /* 3. Dense FFN Tensors (TinyLlama / LLaMA / Qwen-Dense) */
+    w->is_moe = 0;
     snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", layer);
     w->ffn_gate = find_tensor(index, name);
 
@@ -56,8 +96,7 @@ int load_block_weights(TensorIndex *index, int layer, TransformerBlockWeights *w
     snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", layer);
     w->ffn_down = find_tensor(index, name);
 
-    return (w->attn_norm && w->attn_q && w->attn_k && w->attn_v &&
-            w->attn_output && w->ffn_norm && w->ffn_gate && w->ffn_up && w->ffn_down);
+    return (w->ffn_gate && w->ffn_up && w->ffn_down);
 }
 
 int transformer_block_forward(const Model *model,
@@ -71,6 +110,9 @@ int transformer_block_forward(const Model *model,
                               int n_kv_heads,
                               int head_dim,
                               int intermediate_dim,
+                              int num_experts,
+                              int num_active_experts,
+                              int shared_intermediate_dim,
                               float eps,
                               float theta)
 {
@@ -134,9 +176,14 @@ int transformer_block_forward(const Model *model,
     read_float_tensor(model, w->ffn_norm, norm_w, hidden_dim);
     rmsnorm(norm_x, x, norm_w, hidden_dim, eps);
 
-    /* 9. SwiGLU Feed-Forward Network */
-    ffn_swiglu(model, w->ffn_gate, w->ffn_up, w->ffn_down, norm_x,
-               hidden_dim, intermediate_dim, ffn_out);
+    /* 9. Feed-Forward Network: MoE or Dense SwiGLU */
+    if (w->is_moe) {
+        moe_forward(model, &w->moe, norm_x, hidden_dim, intermediate_dim,
+                    num_experts, num_active_experts, shared_intermediate_dim, ffn_out);
+    } else {
+        ffn_swiglu(model, w->ffn_gate, w->ffn_up, w->ffn_down, norm_x,
+                   hidden_dim, intermediate_dim, ffn_out);
+    }
 
     /* 10. Residual Connection 2: x = x + ffn_out */
     for (int i = 0; i < hidden_dim; i++) {
