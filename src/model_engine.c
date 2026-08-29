@@ -14,13 +14,16 @@ static void print_token_clean(const char *tok_str)
 {
     if (!tok_str) return;
 
+    /* Skip BOS tag */
+    if (strcmp(tok_str, "<s>") == 0) return;
+
     /* Handle SentencePiece space prefix (\xe2\x96\x81) */
     const unsigned char *s = (const unsigned char *)tok_str;
     while (*s) {
         if (s[0] == 0xE2 && s[1] == 0x96 && s[2] == 0x81) {
             putchar(' ');
             s += 3;
-        } else if (s[0] == '<' && strstr((const char *)s, "0x") == (const char *)s) {
+        } else if (s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
             /* Raw byte tokens like <0x0A> for newline */
             unsigned int byte_val = 0;
             if (sscanf((const char *)s, "<0x%02X>", &byte_val) == 1) {
