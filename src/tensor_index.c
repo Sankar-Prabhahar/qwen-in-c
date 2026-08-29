@@ -108,6 +108,15 @@ int build_tensor_index(Model *model, GGUFHeader *header, TensorIndex *index){
         index->count++;
     }
 
+    /* After the tensor directory, the data section starts at the next
+     * 32-byte aligned boundary.  Store this in model so every consumer
+     * can compute absolute tensor byte offsets correctly. */
+    {
+        uintptr_t addr = (uintptr_t)p;
+        addr = (addr + 31) & ~(uintptr_t)31;
+        model->data_start = (uint64_t)(addr - (uintptr_t)model->data);
+    }
+
     return 1;
 }
 
