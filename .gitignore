@@ -4,3 +4,5 @@ build/
 *.gguf
 models/*
 !models/.gitkeep
+__pycache__/
+*.pyc

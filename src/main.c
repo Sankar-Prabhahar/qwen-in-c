@@ -12,6 +12,7 @@
 #include "tensor_data.h"
 #include "simd.h"
 #include "gemv.h"
+#include "gemv_q6k.h"
 #include "rmsnorm.h"
 #include "rope.h"
 #include "softmax.h"
@@ -20,17 +21,10 @@
 #include "embedding.h"
 #include "attention.h"
 #include "kv_cache.h"
+#include "ffn.h"
+#include "block.h"
 
 void test_avx2();
-
-static float dot_product_naive(const float *a, const float *b, int n)
-{
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        sum += a[i] * b[i];
-    }
-    return sum;
-}
 
 int main(int argc, char **argv)
 {
@@ -73,13 +67,7 @@ int main(int argc, char **argv)
     }
     printf("\n");
 
-    /* 5. GEMV Sanity & Benchmark */
-    float matrix[4] = {1, 2, 3, 4};
-    float vector[2] = {5, 6};
-    float output[2];
-    gemv_naive(matrix, vector, output, 2, 2);
-    printf("GEMV Test: %.0f, %.0f\n", output[0], output[1]);
-
+    /* 5. GEMV Benchmark */
     #define ROWS 256
     #define COLS 256
     static float big_matrix[ROWS * COLS];
@@ -114,48 +102,7 @@ int main(int argc, char **argv)
     printf("\nGEMV Benchmark (256x256)\n");
     printf("Naive : %.2f ms\n", gemv_naive_ms);
     printf("AVX2  : %.2f ms\n", gemv_avx_ms);
-    printf("Check: %.3f vs %.3f\n", out_naive[0], out_avx[0]);
 
-    /* Dot product benchmark */
-    volatile float sink = 0.0f;
-    QueryPerformanceCounter(&start);
-    for (int i = 0; i < 1000000; i++) {
-        sink += dot_product_naive(a, b, 8);
-    }
-    QueryPerformanceCounter(&end);
-    double naive_ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-
-    QueryPerformanceCounter(&start);
-    for (int i = 0; i < 1000000; i++) {
-        sink += dot_product_avx2(a, b, 8);
-    }
-    QueryPerformanceCounter(&end);
-    double avx_ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
-
-    printf("Dot Product Bench (1M iters) - Naive: %.2f ms, AVX2: %.2f ms (sink: %.1f)\n",
-           naive_ms, avx_ms, sink);
-
-    /* 6. KV Cache & Attention Sanity */
-    KVCache cache;
-    kv_init(&cache, 8, 4);
-    float q_vec[4] = {1, 0, 0, 0};
-    float k1[4] = {1, 0, 0, 0};
-    float v1[4] = {10, 20, 30, 40};
-    float k2[4] = {0, 1, 0, 0};
-    float v2[4] = {50, 60, 70, 80};
-    kv_push(&cache, k1, v1);
-    kv_push(&cache, k2, v2);
-
-    float attn_out[4];
-    attention_cached(q_vec, &cache, attn_out);
-    printf("Cached Attention: ");
-    for (int i = 0; i < 4; i++) {
-        printf("%.3f ", attn_out[i]);
-    }
-    printf("\n");
-    kv_free(&cache);
-
-    /* 7. Model Inspection & Inference Pipeline Validation */
     if (argc < 2) {
         printf("\nUsage: qwen30b <model.gguf>\n");
         return 0;
@@ -176,69 +123,88 @@ int main(int argc, char **argv)
            (unsigned long long)header.tensor_count,
            (unsigned long long)header.metadata_count);
 
-    gguf_print_architecture(&model, &header);
-
     TensorIndex index;
     build_tensor_index(&model, &header, &index);
     printf("Indexed tensors: %llu\n", (unsigned long long)index.count);
     printf("data_start = %llu\n", (unsigned long long)model.data_start);
 
-    /* 8. M8: Real GGML Q6_K Decoder Test on Real Tensor Weight */
-    Tensor *q_tensor = find_tensor(&index, "blk.0.attn_q.weight");
-    if (q_tensor) {
-        printf("\nFound blk.0.attn_q.weight (Type: %u, Offset: %llu, Shape: %llu x %llu)\n",
-               q_tensor->type, (unsigned long long)q_tensor->offset,
-               (unsigned long long)q_tensor->dims[0],
-               (unsigned long long)q_tensor->dims[1]);
+    /* 6. M7: Token Embedding Lookup Test */
+    Tensor *embd_tensor = find_tensor(&index, "token_embd.weight");
+    int hidden_dim = (int)embd_tensor->dims[0];
+    float *x_token = (float *)malloc(hidden_dim * sizeof(float));
 
-        block_q6_K real_block;
-        load_q6k_block(&model, q_tensor, &real_block);
-        q6k_dump_block(&real_block);
-
-        float decoded[QK_K];
-        q6k_decode_block(&real_block, decoded);
-
-        printf("GGML Q6_K Decoded (first 8 values):\n");
-        for (int i = 0; i < 8; i++) {
-            printf("%.6f ", decoded[i]);
-        }
+    if (embedding_lookup(&model, embd_tensor, 450, x_token)) {
+        float norm_sq = 0.0f;
+        for (int i = 0; i < hidden_dim; i++) norm_sq += x_token[i] * x_token[i];
+        printf("\n[M7] Token ID 450 Embedding (Norm: %.4f, First 4 weights): ", sqrtf(norm_sq));
+        for (int i = 0; i < 4; i++) printf("%.6f ", x_token[i]);
         printf("\n");
     }
 
-    /* 9. M7: Token Embedding Lookup Test */
-    Tensor *embd_tensor = find_tensor(&index, "token_embd.weight");
-    if (embd_tensor) {
-        printf("\nFound token_embd.weight (Type: %u, Shape: %llu x %llu)\n",
-               embd_tensor->type,
-               (unsigned long long)embd_tensor->dims[0],
-               (unsigned long long)embd_tensor->dims[1]);
+    /* 7. M9: Real Weight GEMV (Q Projection) */
+    Tensor *q_tensor = find_tensor(&index, "blk.0.attn_q.weight");
+    int q_in_dim = (int)q_tensor->dims[0];
+    int q_out_dim = (int)q_tensor->dims[1];
+    float *q_proj_out = (float *)malloc(q_out_dim * sizeof(float));
 
-        int hidden_dim = (int)embd_tensor->dims[0];
-        float *token_vec = (float *)malloc(hidden_dim * sizeof(float));
+    QueryPerformanceCounter(&start);
+    gemv_q6k(&model, q_tensor, x_token, q_proj_out, q_out_dim, q_in_dim);
+    QueryPerformanceCounter(&end);
+    double gemv_q6k_ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
 
-        if (token_vec) {
-            /* Test token ID 1 (e.g. <s>) */
-            if (embedding_lookup(&model, embd_tensor, 1, token_vec)) {
-                float norm_sq = 0.0f;
-                for (int i = 0; i < hidden_dim; i++) norm_sq += token_vec[i] * token_vec[i];
-                printf("Token ID 1 Embedding (Norm: %.4f, First 6 weights): ", sqrtf(norm_sq));
-                for (int i = 0; i < 6; i++) printf("%.6f ", token_vec[i]);
-                printf("\n");
-            }
+    float q_norm_sq = 0.0f;
+    for (int i = 0; i < q_out_dim; i++) q_norm_sq += q_proj_out[i] * q_proj_out[i];
+    printf("\n[M9] Real Weight GEMV (blk.0.attn_q.weight x token_450):\n");
+    printf("     Time: %.2f ms | Norm: %.4f | First 8 values: ", gemv_q6k_ms, sqrtf(q_norm_sq));
+    for (int i = 0; i < 8; i++) printf("%.6f ", q_proj_out[i]);
+    printf("\n");
 
-            /* Test token ID 450 (e.g. "Hello") */
-            if (embedding_lookup(&model, embd_tensor, 450, token_vec)) {
-                float norm_sq = 0.0f;
-                for (int i = 0; i < hidden_dim; i++) norm_sq += token_vec[i] * token_vec[i];
-                printf("Token ID 450 Embedding (Norm: %.4f, First 6 weights): ", sqrtf(norm_sq));
-                for (int i = 0; i < 6; i++) printf("%.6f ", token_vec[i]);
-                printf("\n");
-            }
+    /* 8. M13: Full Transformer Block 0 Forward Pass */
+    TransformerBlockWeights block0;
+    if (load_block_weights(&index, 0, &block0)) {
+        printf("\n[M13] Loaded all 9 tensor weights for Transformer Block 0 successfully.\n");
 
-            free(token_vec);
+        ModelKVCache kv_cache;
+        int max_seq = 256;
+        int n_heads = 32;
+        int n_kv_heads = 4;
+        int head_dim = 64;
+        int intermediate_dim = 5632;
+        float eps = 1e-5f;
+        float theta = 10000.0f;
+
+        kv_cache_init(&kv_cache, 1, max_seq, n_kv_heads, head_dim);
+
+        /* Clone token embedding to pass into block 0 */
+        float *hidden_state = (float *)malloc(hidden_dim * sizeof(float));
+        memcpy(hidden_state, x_token, hidden_dim * sizeof(float));
+
+        QueryPerformanceCounter(&start);
+        int ok = transformer_block_forward(&model, &block0, &kv_cache, 0, 0,
+                                           hidden_state, hidden_dim, n_heads,
+                                           n_kv_heads, head_dim, intermediate_dim,
+                                           eps, theta);
+        QueryPerformanceCounter(&end);
+        double block_ms = (double)(end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+
+        if (ok) {
+            float block_norm_sq = 0.0f;
+            for (int i = 0; i < hidden_dim; i++) block_norm_sq += hidden_state[i] * hidden_state[i];
+            printf("[M13] Block 0 Forward Pass Completed (Time: %.2f ms, Output Norm: %.4f)\n",
+                   block_ms, sqrtf(block_norm_sq));
+            printf("     First 6 output activations: ");
+            for (int i = 0; i < 6; i++) printf("%.6f ", hidden_state[i]);
+            printf("\n");
         }
+
+        free(hidden_state);
+        kv_cache_free(&kv_cache);
+    } else {
+        printf("Failed to locate all weights for Transformer Block 0.\n");
     }
 
+    free(x_token);
+    free(q_proj_out);
     model_unmap(&model);
     return 0;
 }
