@@ -2,7 +2,11 @@ build/
 *.o
 *.exe
 *.gguf
+*.gguf.tmp
+*.dll
+*.log
 models/*
 !models/.gitkeep
 __pycache__/
 *.pyc
+test_*.c
