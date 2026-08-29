@@ -223,6 +223,47 @@ void engine_generate(Engine *engine,
     kv_cache_free(&cache);
 }
 
+typedef struct {
+    int id;
+    float logit;
+} LogitPair;
+
+static int compare_logit_pairs(const void *a, const void *b)
+{
+    float la = ((const LogitPair *)a)->logit;
+    float lb = ((const LogitPair *)b)->logit;
+    if (lb > la) return 1;
+    if (lb < la) return -1;
+    return 0;
+}
+
+void engine_print_top_logits(const Engine *engine, const float *logits, int k)
+{
+    if (!engine || !logits || k <= 0) return;
+
+    int n = engine->vocab_size;
+    LogitPair *pairs = (LogitPair *)malloc(n * sizeof(LogitPair));
+    if (!pairs) return;
+
+    for (int i = 0; i < n; i++) {
+        pairs[i].id = i;
+        pairs[i].logit = logits[i];
+    }
+
+    qsort(pairs, n, sizeof(LogitPair), compare_logit_pairs);
+
+    if (k > n) k = n;
+    printf("    Top-%d Logits:\n", k);
+    for (int i = 0; i < k; i++) {
+        const char *tok = tokenizer_decode(&engine->tokenizer, pairs[i].id);
+        printf("      [%2d] ID: %5d | Logit: %+8.4f | Token: \"", i + 1, pairs[i].id, pairs[i].logit);
+        print_token_clean(tok);
+        printf("\"\n");
+    }
+    free(pairs);
+    fflush(stdout);
+}
+
 void engine_free(Engine *engine)
 {
     if (!engine) return;
@@ -235,3 +276,4 @@ void engine_free(Engine *engine)
     tokenizer_free(&engine->tokenizer);
     model_unmap(&engine->model);
 }
+

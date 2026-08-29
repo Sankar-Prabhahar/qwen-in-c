@@ -49,6 +49,10 @@ void engine_generate(Engine *engine,
                      int max_new_tokens,
                      SamplerConfig *config);
 
+void engine_print_top_logits(const Engine *engine,
+                             const float *logits,
+                             int k);
+
 void engine_free(Engine *engine);
 
 #endif
